@@ -44,7 +44,7 @@ jobs:
           EOF
 
           cat << 'EOF' > gradle.properties
-          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
           android.useAndroidX=true
           kotlin.code.style=official
           android.nonTransitiveRClass=true
@@ -133,11 +133,13 @@ jobs:
           </manifest>
           EOF
 
-      - name: Setup Gradle and Build APK
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
-          arguments: assembleDebug
+
+      - name: Compile Debug APK
+        run: gradle assembleDebug --stacktrace
 
       - name: Upload Compiled APK
         uses: actions/upload-artifact@v4

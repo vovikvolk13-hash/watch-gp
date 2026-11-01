@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.speech.RecognizerIntent
 import android.util.Base64
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -16,15 +17,14 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTransformGestures
-import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -35,13 +35,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.rotary.onRotaryScrollEvent
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
@@ -58,7 +55,6 @@ import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.material.*
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import kotlinx.coroutines.launch
 import org.json.JSONArray
 
 data class ChatMessage(val role: String, val text: String, val images: List<String>)
@@ -68,13 +64,81 @@ enum class WatchScreen {
     VOICE_HOME, CHAT_VIEW, CHAT_LIST, TEXT_INPUT, WEB_LOGIN, IMAGE_VIEW
 }
 
+class WebBridge(
+    private val onMessages: (String, Boolean) -> Unit,
+    private val onChats: (String) -> Unit
+) {
+    @JavascriptInterface
+    fun onMessagesUpdated(json: String, isGenerating: Boolean) {
+        onMessages(json, isGenerating)
+    }
+
+    @JavascriptInterface
+    fun onChatsUpdated(json: String) {
+        onChats(json)
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        var startupCrash by mutableStateOf<String?>(null)
+
+        Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
+            val msg = "${throwable.javaClass.simpleName}: ${throwable.localizedMessage}"
+            Handler(Looper.getMainLooper()).post {
+                startupCrash = msg
+            }
+        }
+
         setContent {
             MaterialTheme {
-                WatchGptApp()
+                if (startupCrash != null) {
+                    ErrorScreen(errorText = startupCrash!!) {
+                        startupCrash = null
+                    }
+                } else {
+                    WatchGptApp()
+                }
             }
+        }
+    }
+}
+
+@Composable
+fun ErrorScreen(errorText: String, onDismiss: () -> Unit) {
+    val listState = rememberScalingLazyListState()
+    ScalingLazyColumn(
+        state = listState,
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .padding(8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        item {
+            Text(
+                text = "Ошибка:",
+                color = Color(0xFFFF5252),
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp
+            )
+        }
+        item {
+            Text(
+                text = errorText,
+                color = Color.White,
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(vertical = 6.dp)
+            )
+        }
+        item {
+            CompactChip(
+                onClick = onDismiss,
+                label = { Text("Продолжить", fontSize = 12.sp) }
+            )
         }
     }
 }
@@ -90,11 +154,12 @@ fun WatchGptApp() {
         mutableStateOf(prefs.getString("project_url", "https://chatgpt.com/") ?: "https://chatgpt.com/")
     }
     var currentScreen by remember { mutableStateOf(WatchScreen.VOICE_HOME) }
-    var statusText by remember { mutableStateOf("Готов (проект «С часов»)") }
+    var statusText by remember { mutableStateOf("Готов («С часов»)") }
     var messages by remember { mutableStateOf<List<ChatMessage>>(emptyList()) }
     var chatList by remember { mutableStateOf<List<ChatHistoryItem>>(emptyList()) }
     var selectedImageUrl by remember { mutableStateOf<String?>(null) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    var webViewError by remember { mutableStateOf<String?>(null) }
 
     fun sendTextToChatGpt(prompt: String) {
         if (prompt.isBlank()) return
@@ -128,7 +193,11 @@ fun WatchGptApp() {
                 }, 350);
             })();
         """.trimIndent()
-        webViewRef?.evaluateJavascript(js, null)
+        try {
+            webViewRef?.evaluateJavascript(js, null)
+        } catch (t: Throwable) {
+            statusText = "Ошибка отправки: ${t.javaClass.simpleName}"
+        }
     }
 
     val voiceLauncher = rememberLauncherForActivityResult(
@@ -150,15 +219,14 @@ fun WatchGptApp() {
         }
         try {
             voiceLauncher.launch(intent)
-        } catch (e: Exception) {
+        } catch (t: Throwable) {
             statusText = "Голосовой ввод недоступен"
         }
     }
 
     val bridge = remember {
-        object {
-            @JavascriptInterface
-            fun onMessagesUpdated(json: String, isGenerating: Boolean) {
+        WebBridge(
+            onMessages = { json, isGenerating ->
                 mainHandler.post {
                     try {
                         val arr = JSONArray(json)
@@ -180,12 +248,10 @@ fun WatchGptApp() {
                         }
                         messages = parsed
                         statusText = if (isGenerating) "Печатает..." else "Готов"
-                    } catch (_: Exception) {}
+                    } catch (_: Throwable) {}
                 }
-            }
-
-            @JavascriptInterface
-            fun onChatsUpdated(json: String) {
+            },
+            onChats = { json ->
                 mainHandler.post {
                     try {
                         val arr = JSONArray(json)
@@ -203,97 +269,118 @@ fun WatchGptApp() {
                             }
                         }
                         if (parsed.isNotEmpty()) chatList = parsed
-                    } catch (_: Exception) {}
+                    } catch (_: Throwable) {}
                 }
             }
+        )
+    }
+
+    if (webViewError != null) {
+        ErrorScreen(errorText = "Системный WebView недоступен на часах:\n$webViewError") {
+            webViewError = null
         }
+        return
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        // Фоновый (или видимый в режиме входа) WebView, который держит сессию ChatGPT
+        // Безопасный контейнер для WebView без прозрачных GPU-слоев
         AndroidView(
             factory = { ctx ->
-                WebView(ctx).apply {
+                FrameLayout(ctx).apply {
                     layoutParams = ViewGroup.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
-                    CookieManager.getInstance().setAcceptCookie(true)
-                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                    try {
+                        val wv = WebView(ctx).apply {
+                            layoutParams = FrameLayout.LayoutParams(
+                                FrameLayout.LayoutParams.MATCH_PARENT,
+                                FrameLayout.LayoutParams.MATCH_PARENT
+                            )
+                            runCatching {
+                                CookieManager.getInstance().setAcceptCookie(true)
+                                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                            }
+                            settings.apply {
+                                javaScriptEnabled = true
+                                domStorageEnabled = true
+                                databaseEnabled = true
+                                useWideViewPort = true
+                                loadWithOverviewMode = true
+                                builtInZoomControls = true
+                                displayZoomControls = false
+                                userAgentString = "Mozilla/5.0 (Linux; Android 14; SM-R910) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+                                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                            }
+                            addJavascriptInterface(bridge, "WatchBridge")
+                            webChromeClient = WebChromeClient()
+                            webViewClient = object : WebViewClient() {
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    runCatching { CookieManager.getInstance().flush() }
+                                    val scraperJs = """
+                                        (function() {
+                                            if (window.__watchScraperActive) return;
+                                            window.__watchScraperActive = true;
+                                            setInterval(() => {
+                                                try {
+                                                    const nodes = document.querySelectorAll('[data-message-author-role]');
+                                                    const msgs = [];
+                                                    nodes.forEach(n => {
+                                                        const role = n.getAttribute('data-message-author-role') || 'assistant';
+                                                        const text = (n.innerText || '').trim();
+                                                        const imgs = [];
+                                                        n.querySelectorAll('img').forEach(img => {
+                                                            if (img.src && !img.src.includes('avatar') && (img.naturalWidth === 0 || img.naturalWidth > 48)) {
+                                                                imgs.push(img.src);
+                                                            }
+                                                        });
+                                                        msgs.push({ role, text, images: imgs });
+                                                    });
+                                                    const stopBtn = document.querySelector('[data-testid="stop-button"]') ||
+                                                                    document.querySelector('button[aria-label*="Stop"]');
+                                                    window.WatchBridge.onMessagesUpdated(JSON.stringify(msgs), !!stopBtn);
 
-                    settings.apply {
-                        javaScriptEnabled = true
-                        domStorageEnabled = true
-                        databaseEnabled = true
-                        useWideViewPort = true
-                        loadWithOverviewMode = true
-                        builtInZoomControls = true
-                        displayZoomControls = false
-                        // Убираем маркер WebView (; wv), чтобы Google/OpenAI и Cloudflare пускали без ограничений
-                        userAgentString = "Mozilla/5.0 (Linux; Android 14; SM-R910) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
-                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    }
-
-                    addJavascriptInterface(bridge, "WatchBridge")
-                    webChromeClient = WebChromeClient()
-                    webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            super.onPageFinished(view, url)
-                            CookieManager.getInstance().flush()
-                            val scraperJs = """
-                                (function() {
-                                    if (window.__watchScraperActive) return;
-                                    window.__watchScraperActive = true;
-                                    setInterval(() => {
-                                        try {
-                                            const nodes = document.querySelectorAll('[data-message-author-role]');
-                                            const msgs = [];
-                                            nodes.forEach(n => {
-                                                const role = n.getAttribute('data-message-author-role') || 'assistant';
-                                                const text = (n.innerText || '').trim();
-                                                const imgs = [];
-                                                n.querySelectorAll('img').forEach(img => {
-                                                    if (img.src && !img.src.includes('avatar') && (img.naturalWidth === 0 || img.naturalWidth > 48)) {
-                                                        imgs.push(img.src);
+                                                    const links = document.querySelectorAll('nav a[href], a[href^="/c/"], a[href*="/project"]');
+                                                    const chats = [];
+                                                    const seen = new Set();
+                                                    links.forEach(a => {
+                                                        const href = a.href;
+                                                        const title = (a.innerText || '').trim().replace(/\n+/g, ' ');
+                                                        if (href && title && !seen.has(href) && (href.includes('/c/') || href.includes('/project') || href.includes('/g/'))) {
+                                                            seen.add(href);
+                                                            chats.push({ title, url: href });
+                                                        }
+                                                    });
+                                                    if (chats.length > 0) {
+                                                        window.WatchBridge.onChatsUpdated(JSON.stringify(chats));
                                                     }
-                                                });
-                                                msgs.push({ role, text, images: imgs });
-                                            });
-                                            const stopBtn = document.querySelector('[data-testid="stop-button"]') ||
-                                                            document.querySelector('button[aria-label*="Stop"]');
-                                            window.WatchBridge.onMessagesUpdated(JSON.stringify(msgs), !!stopBtn);
-
-                                            const links = document.querySelectorAll('nav a[href], a[href^="/c/"], a[href*="/project"]');
-                                            const chats = [];
-                                            const seen = new Set();
-                                            links.forEach(a => {
-                                                const href = a.href;
-                                                const title = (a.innerText || '').trim().replace(/\n+/g, ' ');
-                                                if (href && title && !seen.has(href) && (href.includes('/c/') || href.includes('/project') || href.includes('/g/'))) {
-                                                    seen.add(href);
-                                                    chats.push({ title, url: href });
-                                                }
-                                            });
-                                            if (chats.length > 0) {
-                                                window.WatchBridge.onChatsUpdated(JSON.stringify(chats));
-                                            }
-                                        } catch (e) {}
-                                    }, 1000);
-                                })();
-                            """.trimIndent()
-                            view?.evaluateJavascript(scraperJs, null)
+                                                } catch (e) {}
+                                            }, 1000);
+                                        })();
+                                    """.trimIndent()
+                                    view?.evaluateJavascript(scraperJs, null)
+                                }
+                            }
+                            loadUrl(projectUrl)
                         }
+                        webViewRef = wv
+                        addView(wv)
+                    } catch (t: Throwable) {
+                        webViewError = "${t.javaClass.simpleName}: ${t.localizedMessage}"
                     }
-                    loadUrl(projectUrl)
-                    webViewRef = this
                 }
             },
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer { alpha = if (currentScreen == WatchScreen.WEB_LOGIN) 1f else 0f }
+            update = { container ->
+                container.visibility = if (currentScreen == WatchScreen.WEB_LOGIN) View.VISIBLE else View.INVISIBLE
+            },
+            modifier = if (currentScreen == WatchScreen.WEB_LOGIN) {
+                Modifier.fillMaxSize()
+            } else {
+                Modifier.size(1.dp)
+            }
         )
 
-        // Нативный интерфейс для часов поверх WebView
         when (currentScreen) {
             WatchScreen.VOICE_HOME -> {
                 VoiceHomeScreen(
@@ -302,15 +389,16 @@ fun WatchGptApp() {
                     onNewProjectChat = {
                         messages = emptyList()
                         statusText = "Новый чат («С часов»)..."
-                        webViewRef?.loadUrl(projectUrl)
+                        runCatching { webViewRef?.loadUrl(projectUrl) }
                     },
                     onOpenChatView = { currentScreen = WatchScreen.CHAT_VIEW },
                     onOpenChatList = {
-                        // Пробуем раскрыть боковое меню в фоне, чтобы подтянуть свежий список чатов
-                        webViewRef?.evaluateJavascript(
-                            """(document.querySelector('button[aria-label*="sidebar"]') || document.querySelector('button[aria-label*="меню"]'))?.click();""",
-                            null
-                        )
+                        runCatching {
+                            webViewRef?.evaluateJavascript(
+                                """(document.querySelector('button[aria-label*="sidebar"]') || document.querySelector('button[aria-label*="меню"]'))?.click();""",
+                                null
+                            )
+                        }
                         currentScreen = WatchScreen.CHAT_LIST
                     },
                     onOpenTextInput = { currentScreen = WatchScreen.TEXT_INPUT },
@@ -338,12 +426,12 @@ fun WatchGptApp() {
                     onSelectChat = { item ->
                         messages = emptyList()
                         statusText = "Загрузка: ${item.title}"
-                        webViewRef?.loadUrl(item.url)
+                        runCatching { webViewRef?.loadUrl(item.url) }
                         currentScreen = WatchScreen.CHAT_VIEW
                     },
                     onNewChatInProject = {
                         messages = emptyList()
-                        webViewRef?.loadUrl(projectUrl)
+                        runCatching { webViewRef?.loadUrl(projectUrl) }
                         currentScreen = WatchScreen.VOICE_HOME
                     },
                     onBack = { currentScreen = WatchScreen.VOICE_HOME }
@@ -365,7 +453,6 @@ fun WatchGptApp() {
             }
 
             WatchScreen.WEB_LOGIN -> {
-                // Плавающие кнопки поверх открытого сайта ChatGPT
                 Box(modifier = Modifier.fillMaxSize()) {
                     Row(
                         modifier = Modifier
@@ -409,23 +496,13 @@ fun VoiceHomeScreen(
     onOpenWebMode: () -> Unit
 ) {
     val listState = rememberScalingLazyListState()
-    val coroutineScope = rememberCoroutineScope()
-    val focusRequester = remember { FocusRequester() }
-
-    LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
     Scaffold(timeText = { TimeText() }, vignette = { Vignette(VignettePosition.TopAndBottom) }) {
         ScalingLazyColumn(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black)
-                .onRotaryScrollEvent {
-                    coroutineScope.launch { listState.scrollBy(it.verticalScrollPixels) }
-                    true
-                }
-                .focusRequester(focusRequester)
-                .focusable(),
+                .background(Color.Black),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             item {
@@ -440,7 +517,6 @@ fun VoiceHomeScreen(
                 )
             }
             item {
-                // Главная крупная кнопка микрофона
                 Button(
                     onClick = onVoiceClick,
                     modifier = Modifier.size(76.dp),
@@ -503,14 +579,11 @@ fun ChatViewScreen(
     onBackHome: () -> Unit
 ) {
     val listState = rememberScalingLazyListState()
-    val coroutineScope = rememberCoroutineScope()
-    val focusRequester = remember { FocusRequester() }
     val context = LocalContext.current
 
     LaunchedEffect(messages.size) {
-        focusRequester.requestFocus()
         if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.size)
+            runCatching { listState.animateScrollToItem(messages.size) }
         }
     }
 
@@ -522,13 +595,7 @@ fun ChatViewScreen(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black)
-                .onRotaryScrollEvent {
-                    coroutineScope.launch { listState.scrollBy(it.verticalScrollPixels) }
-                    true
-                }
-                .focusRequester(focusRequester)
-                .focusable(),
+                .background(Color.Black),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             item {
@@ -577,12 +644,12 @@ fun ChatViewScreen(
                         )
                     }
                     msg.images.forEach { imgUrl ->
-                        val cookie = CookieManager.getInstance().getCookie(imgUrl) ?: ""
+                        val cookie = runCatching { CookieManager.getInstance().getCookie(imgUrl) }.getOrNull() ?: ""
                         AsyncImage(
                             model = ImageRequest.Builder(context)
                                 .data(imgUrl)
                                 .addHeader("Cookie", cookie)
-                                .diskCachePolicy(coil.request.CachePolicy.DISABLED) // Без сохранения на диск
+                                .diskCachePolicy(coil.request.CachePolicy.DISABLED)
                                 .build(),
                             contentDescription = "Изображение",
                             contentScale = ContentScale.Crop,
@@ -619,10 +686,6 @@ fun ChatListScreen(
     onBack: () -> Unit
 ) {
     val listState = rememberScalingLazyListState()
-    val coroutineScope = rememberCoroutineScope()
-    val focusRequester = remember { FocusRequester() }
-
-    LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
     Scaffold(
         timeText = { TimeText() },
@@ -632,13 +695,7 @@ fun ChatListScreen(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black)
-                .onRotaryScrollEvent {
-                    coroutineScope.launch { listState.scrollBy(it.verticalScrollPixels) }
-                    true
-                }
-                .focusRequester(focusRequester)
-                .focusable(),
+                .background(Color.Black),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             item {
@@ -687,9 +744,6 @@ fun TextInputScreen(
     onCancel: () -> Unit
 ) {
     var text by remember { mutableStateOf("") }
-    val focusRequester = remember { FocusRequester() }
-
-    LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
     Column(
         modifier = Modifier
@@ -711,11 +765,10 @@ fun TextInputScreen(
                 .height(64.dp)
                 .clip(RoundedCornerShape(10.dp))
                 .background(Color(0xFF22252A))
-                .padding(8.dp)
-                .focusRequester(focusRequester),
+                .padding(8.dp),
             decorationBox = { innerTextField ->
                 if (text.isEmpty()) {
-                    Text("Введите сообщение...", color = Color.Gray, fontSize = 13.sp)
+                    Text("Нажмите для ввода...", color = Color.Gray, fontSize = 13.sp)
                 }
                 innerTextField()
             }
@@ -744,7 +797,9 @@ fun ImageViewScreen(
     var scale by remember { mutableStateOf(1f) }
     var offsetX by remember { mutableStateOf(0f) }
     var offsetY by remember { mutableStateOf(0f) }
-    val cookie = remember(imageUrl) { CookieManager.getInstance().getCookie(imageUrl) ?: "" }
+    val cookie = remember(imageUrl) {
+        runCatching { CookieManager.getInstance().getCookie(imageUrl) }.getOrNull() ?: ""
+    }
 
     Box(
         modifier = Modifier
